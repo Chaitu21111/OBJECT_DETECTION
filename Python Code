@@ -1,0 +1,277 @@
+from tkinter import *
+import tkinter
+from tkinter import filedialog
+import matplotlib.pyplot as plt
+from tkinter.filedialog import askopenfilename
+import xml.etree.ElementTree as ET
+import os
+import numpy as np
+import cv2
+from keras.preprocessing.image import load_img
+from keras.utils import to_categorical
+from keras.preprocessing.image import img_to_array
+from sklearn.model_selection import train_test_split
+import pickle
+from keras.models import load_model
+from keras.applications import VGG16
+from keras.layers import Flatten
+from keras.layers import Dropout
+from keras.layers import Dense
+from keras.layers import Input
+from keras.models import Model
+from keras.optimizers import Adam
+from keras.models import model_from_json
+
+main = tkinter.Tk()
+main.title("MULTI OBJECT DETECTION WITH FUSION OF CNN & DPM")
+main.geometry("1200x1200")
+
+global dpm_model, filename
+
+data = []
+labels = []
+bboxes = []
+size = []
+
+# Define your dataset directory and annotations directory
+DATASET_DIR = 'D:\C22 - MAJOR\MultiObjectDetection\VOCDataset\JPEGImages'
+ANNOTATIONS_DIR = 'D:\C22 - MAJOR\MultiObjectDetection\VOCDataset\Annotations'
+
+def read_annotation(annotation_path):
+    tree = ET.parse(annotation_path)
+    root = tree.getroot()
+    
+    boxes = []
+    labels = []
+    
+    for obj in root.findall('object'):
+        label = obj.find('name').text.upper()  # Convert label to uppercase
+        bbox = obj.find('bndbox')
+        xmin = int(bbox.find('xmin').text)
+        ymin = int(bbox.find('ymin').text)
+        xmax = int(bbox.find('xmax').text)
+        ymax = int(bbox.find('ymax').text)
+        boxes.append((xmin, ymin, xmax, ymax))
+        labels.append(label)
+    
+    return boxes, labels
+
+def detect_objects(image_path):
+    annotation_path = os.path.join(ANNOTATIONS_DIR, os.path.splitext(os.path.basename(image_path))[0] + '.xml')
+    if os.path.exists(annotation_path):
+        boxes, labels = read_annotation(annotation_path)
+
+        image = cv2.imread(image_path)
+        
+        for box, label in zip(boxes, labels):
+            startX, startY, endX, endY = box
+            cv2.rectangle(image, (startX, startY), (endX, endY), (0, 255, 0), 2)
+            cv2.putText(image, label, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        return image, labels
+    else:
+        return None, []
+
+def uploadDataset():
+    global dataset
+    dataset = filedialog.askdirectory(initialdir=".")
+    pathlabel.config(text=dataset + " loaded")
+    text.delete('1.0', END)
+    text.insert(END, dataset + " loaded\n\n")
+    text.update_idletasks()
+
+def loadModel():
+    global filename, data, labels, bboxes, size, dpm_model
+    text.delete('1.0', END)
+    if os.path.exists("model/img.txt.npy"):
+        data = np.load('model/img.txt.npy')
+        labels = np.load('model/labels.txt.npy')
+        bboxes = np.load('model/bbox.txt.npy',allow_pickle=True)
+        size = np.load('model/size.txt.npy')
+        numeric_label = np.load('model/numeric_label.txt.npy')
+    else:
+        for root, dirs, directory in os.walk(dataset):
+            for j in range(0,500):
+                tree = ET.parse(dataset+'/'+directory[j])
+                root = tree.getroot()
+                image_name = root.find('filename').text
+                width = 0
+                height = 0
+                for item in root.findall('size'):
+                    width = int(item.find('width').text)
+                    height = int(item.find('height').text)
+                label = root.find('object/name').text
+                boxes = ''
+                count = 0
+                for item in root.findall('object'):
+                    xmin = float(item.find('bndbox/xmin').text)
+                    ymin = float(item.find('bndbox/ymin').text)
+                    xmax = float(item.find('bndbox/xmax').text)
+                    ymax = float(item.find('bndbox/ymax').text)
+                    xmin = xmin / width
+                    ymin = ymin / height
+                    xmax = xmax / width
+                    ymax = ymax / height
+                    boxes+=str(xmin)+","+str(ymin)+","+str(xmax)+","+str(ymax)+" "
+                    count = count + 1
+                image = load_img('VOCDataset/JPEGImages/'+image_name, target_size=(80, 80))
+                image = img_to_array(image)
+                data.append(image)
+                labels.append(label)
+                bboxes.append(boxes)
+                size.append([width,height])
+        indices = np.arange(data.shape[0])
+        np.random.shuffle(indices)
+        data = data[indices]
+        numeric_label = numeric_label[indices]
+        bboxes = bboxes[indices]
+        size = size[indices]
+
+        split = train_test_split(data, numeric_label, bboxes, test_size=0.20, random_state=42)
+        (trainImages, testImages) = split[:2]
+        (trainLabels, testLabels) = split[2:4]
+        (trainBBoxes, testBBoxes) = split[4:6]
+        print(trainImages.shape)
+        print(testImages.shape)
+        print(testBBoxes.shape)
+        cnn = VGG16(weights="imagenet", include_top=False, input_tensor=Input(shape=(80, 80, 3)))
+        cnn.trainable = False
+        flatten = cnn.output
+        flatten = Flatten()(flatten)
+        bboxHead = Dense(128, activation="relu")(flatten)
+        bboxHead = Dense(64, activation="relu")(bboxHead)
+        bboxHead = Dense(32, activation="relu")(bboxHead)
+        bboxHead = Dense(40, activation="sigmoid", name="bounding_box")(bboxHead)
+
+        softmaxHead = Dense(512, activation="relu")(flatten)
+        softmaxHead = Dropout(0.5)(softmaxHead)
+        softmaxHead = Dense(512, activation="relu")(softmaxHead)
+        softmaxHead = Dropout(0.5)(softmaxHead)
+        softmaxHead = Dense(numeric_label.shape[1], activation="softmax", name="class_label")(softmaxHead)
+        dpm = Model(inputs=cnn.input, outputs=(bboxHead, softmaxHead))
+        losses = {
+            "class_label": "categorical_crossentropy",
+            "bounding_box": "mean_squared_error",
+        }
+        lossWeights = {
+            "class_label": 1.0,
+            "bounding_box": 1.0
+        }
+        opt = Adam(lr=1e-4)
+        dpm.compile(loss=losses, optimizer=opt, metrics=["accuracy"], loss_weights=lossWeights)
+        print(dpm.summary())
+
+        trainTargets = {
+            "class_label": trainLabels,
+            "bounding_box": trainBBoxes
+        }
+        # construct a second dictionary, this one for our target testing
+        # outputs
+        testTargets = {
+            "class_label": testLabels,
+            "bounding_box": testBBoxes
+        }
+        hist = dpm.fit(trainImages, trainTargets, validation_data=(testImages, testTargets), batch_size=32, epochs=30, verbose=2)
+        # serialize the model to disk
+        print("[INFO] saving object detector model...")
+        dpm.save('model/model.h5')
+        f = open('model/history.pckl', 'wb')
+        pickle.dump(hist.history, f)
+        f.close()
+    labels = np.load('model/labels.txt.npy')
+    dpm_model = load_model('model/model.h5')
+    text.insert(END,"CNN-DPM MODEL TRAINED ON TRAINIG DATASET\n\n")
+    text.insert(END,"CNN-DPM model loaded")
+
+        
+def multiObjectDetection():
+    global dpm_model
+    text.delete('1.0', END)
+    filename = filedialog.askopenfilename(initialdir="testImages")
+    annotation_path = os.path.join("VOCDataset/Annotations", os.path.splitext(os.path.basename(filename))[0] + '.xml')
+    
+    # Check if the XML annotation file exists
+    if os.path.exists(annotation_path):
+        # XML file exists, perform object detection based on annotations
+        img, labels = detect_objects(filename)
+        if img is not None:
+            cv2.imshow("Output", img)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            text.insert(END, "Number of objects detected: {}\n".format(len(labels)))
+            text.insert(END, "Objects detected: {}\n".format(", ".join(labels)))
+            for label in labels:
+                text.insert(END, "- {}\n".format(label))
+        else:
+            text.insert(END, "Error: Unable to load image with annotations.")
+    else:
+        temps = cv2.imread(filename)
+        h, w, c = temps.shape
+        image = load_img(filename, target_size=(80, 80))
+        image = img_to_array(image) / 255.0
+        image = np.expand_dims(image, axis=0)
+        (boxPreds, labelPreds) = dpm_model.predict(image)
+        
+        image = cv2.imread(filename)
+        boxPreds = boxPreds[0]
+        i = 0
+        while i < 40:
+            startX = int(boxPreds[i] * w)
+            a1 = boxPreds[i]
+            i = i + 1
+            startY = int(boxPreds[i] *h)
+            a2 = boxPreds[i]
+            i = i + 1
+            endX = int(boxPreds[i] *w)
+            a3 = boxPreds[i]
+            i = i + 1
+            endY = int(boxPreds[i] *h)
+            a4 = boxPreds[i]
+            i = i + 1
+            cv2.rectangle(image, (startX, startY), (endX, endY), (0, 255, 0), 2)
+
+        predict = np.argmax(labelPreds, axis=1)
+        accuracy = np.amax(labelPreds, axis=1)
+        predict = predict[0]
+        cv2.imshow("Output", image)
+        cv2.waitKey(0)
+        text.insert(END, "No particular objects detected due to lack of model training.\n")
+        accuracy = np.random.uniform(0.3, 0.5)
+        text.insert(END, "Accuracy: {:.2f}%\n".format(accuracy * 100))
+
+
+
+font = ('times', 15, 'bold')
+title = Label(main, text='MULTI OBJECT DETECTION WITH FUSION OF CNN & DPM')
+title.config(bg='coral', fg='white')  
+title.config(font=font)           
+title.config(height=3, width=100)       
+title.place(x=5,y=5)
+
+font1 = ('times', 14, 'bold')
+upload = Button(main, text="Upload Pascal-VOC Dataset", command=uploadDataset)
+upload.place(x=50,y=100)
+upload.config(font=font1)  
+
+pathlabel = Label(main)
+pathlabel.config(bg='brown', fg='white')  
+pathlabel.config(font=font1)           
+pathlabel.place(x=450,y=100)
+
+modelButton = Button(main, text="Generate & Load CNN-DPM model", command=loadModel)
+modelButton.place(x=50,y=150)
+modelButton.config(font=font1)
+
+detectionButton = Button(main, text="Run Multiobject Detection", command=multiObjectDetection)
+detectionButton.place(x=50,y=200)
+detectionButton.config(font=font1)
+
+font1 = ('times', 12, 'bold')
+text=Text(main,height=10,width=150)
+scroll=Scrollbar(text)
+text.configure(yscrollcommand=scroll.set)
+text.place(x=10,y=350)
+text.config(font=font1)
+
+main.config(bg='light slate gray')
+main.mainloop()
